@@ -28,6 +28,4 @@ jobs:
 
       - name: Build Example
         run: |
-            sudo apt update && sudo apt dist-upgrade
-            sudo apt install linux-headers-generic
             make
