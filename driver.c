@@ -4,6 +4,7 @@
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
 
 #define DRIVER_NAME "buffer-driver"
 #define DEFAULT_BUFFER_SIZE 1024
