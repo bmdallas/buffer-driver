@@ -28,5 +28,6 @@ jobs:
 
       - name: Build Example
         run: |
-            sudo apt install linux-headers-generic_4.15.0.157.146
+            sudo apt update && sudo apt dist-upgrade
+            sudo apt install linux-headers-generic
             make
