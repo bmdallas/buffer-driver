@@ -1,4 +1,4 @@
-MODULE_NAME:=abc-reader
+MODULE_NAME:=buffer-driver
 
 # If we are running by kernel building system
 ifneq ($(KERNELRELEASE),)

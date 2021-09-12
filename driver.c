@@ -1,85 +1,189 @@
 #include "driver.h"
 
+#include <linux/cdev.h>
+#include <linux/device/class.h>
 #include <linux/fs.h>
+#include <linux/slab.h>
 
-static int driver_major_number = 0;
-static const char DRIVER_NAME[] = "abc-reader";
+#define DRIVER_NAME "buffer-driver"
+#define DEFAULT_BUFFER_SIZE 1024
 
-static const char DEVICE_READ_STRING[] = "abcdefghijklmnopqrstuvwxyz";
-static const size_t DEVICE_READ_STRING_SIZE = sizeof(DEVICE_READ_STRING);
+static char *driver_buffer = NULL;
+static size_t driver_buffer_length = 0;
 
-static struct file_operations reader_file_ops =
+struct class *driver_class;
+struct cdev driver_cdev;
+dev_t dev_num;
+
+static struct file_operations buffer_file_ops =
 {
   .owner = THIS_MODULE,
-  .read = reader_read,
-  .open = reader_open,
-  .release = reader_release
+  .read = buffer_read,
+  .write = buffer_write,
+  .open = buffer_open,
+  .release = buffer_release
 };
 
-static int reader_open(struct inode *inode, struct file *file)
+static int buffer_open(struct inode *inode, struct file *file)
 {
     return 0;
 }
 
-static int reader_release(struct inode *inode, struct file *file)
+static int buffer_release(struct inode *inode, struct file *file)
 {
     return 0;
 }
 
-static ssize_t reader_read(struct file *file_ptr, char __user *user_buffer, size_t count, loff_t *position)
+static ssize_t buffer_write(struct file *file_ptr, const char __user *user_buffer, size_t len, loff_t *offset)
 {
-    size_t total_bytes_copied = 0;
-    size_t num_full_copies = 0;
-    size_t partial_copy_amount = count;
-    size_t copy_num = 0;
-    int copy_return_code = 0;
-    if (partial_copy_amount > DEVICE_READ_STRING_SIZE)
+    size_t user_offset = 0;
+    int return_value = 0;
+    size_t actual_write_len = len;
+    printk( KERN_NOTICE "Entering write with %ld bytes at offset %lld", len, *offset );
+    if (actual_write_len > driver_buffer_length)
     {
-        // This truncates to the correct amount
-        num_full_copies = partial_copy_amount / DEVICE_READ_STRING_SIZE;
-
-        // This is the partial amount to copy at the end
-        partial_copy_amount = partial_copy_amount % DEVICE_READ_STRING_SIZE;
+        /* Only take the last overwrite of the buffer */
+        user_offset = len - driver_buffer_length;
+        actual_write_len = driver_buffer_length;
     }
 
-    for (copy_num = 0; copy_num < num_full_copies; copy_num++)
+    if (*offset + actual_write_len > driver_buffer_length)
     {
-        copy_return_code = copy_to_user(&user_buffer[DEVICE_READ_STRING_SIZE*copy_num], DEVICE_READ_STRING, DEVICE_READ_STRING_SIZE);
-        if (copy_return_code > 0)
+        size_t initial_copy = actual_write_len - *offset;
+        return_value = copy_from_user(&driver_buffer[*offset], &user_buffer[user_offset], initial_copy);
+        if (return_value == 0)
         {
-            total_bytes_copied += copy_return_code;
+            return_value = copy_from_user(driver_buffer, &user_buffer[user_offset + initial_copy], len - initial_copy);
+        }
+
+        if (return_value == 0)
+        {
+            return_value = actual_write_len;
         }
         else
         {
-            break;
+            return_value = -EFAULT;
         }
     }
-
-    if (copy_return_code >= 0)
+    else
     {
-        copy_return_code = copy_to_user(user_buffer, "Hello World", count);
-        if (copy_return_code > 0)
+        if (copy_from_user(&driver_buffer[*offset], &user_buffer[user_offset], len))
         {
-            total_bytes_copied += copy_return_code;
+            return_value = -EFAULT;
+        }
+        else
+        {
+            return_value = actual_write_len;
         }
     }
 
-    if (copy_return_code < 0)
-    {
-        printk(KERN_ERR "Failed to read %li bytes from %s", count, DRIVER_NAME);
-        total_bytes_copied = -EFAULT;
-    }
-
-    return total_bytes_copied;
+    printk( KERN_NOTICE "exiting write %d", return_value );
+    return return_value;
 }
 
-
-int register_device(void)
+static ssize_t buffer_read(struct file *file_ptr, char __user *user_buffer, size_t len, loff_t *offset)
 {
+    int return_value = 0;
+    int actual_read_len = min(len, driver_buffer_length);
+
+    if (*offset >= driver_buffer_length)
+    {
+        *offset = *offset % driver_buffer_length;
+    }
+
+    if (*offset + actual_read_len > driver_buffer_length)
+    {
+        size_t initial_copy = driver_buffer_length - *offset;
+        size_t bytes_left = actual_read_len - initial_copy;
+        size_t bytes_copied = 0;
+        return_value = copy_to_user(user_buffer, &driver_buffer[*offset], initial_copy);
+        bytes_copied = initial_copy;
+
+        while (bytes_left != 0 && return_value == 0)
+        {
+            size_t copy_size = min(bytes_left, driver_buffer_length);
+            return_value = copy_to_user(&user_buffer[bytes_copied], driver_buffer, copy_size);
+            bytes_copied += copy_size;
+            bytes_left -= copy_size;
+        }
+
+        if (return_value != 0)
+        {
+            return_value = -EFAULT;
+        }
+        else
+        {
+            return_value = actual_read_len;
+        }
+    }
+    else
+    {
+        if (copy_to_user(user_buffer, &driver_buffer[*offset], actual_read_len))
+        {
+            return_value = -EFAULT;
+        }
+        else
+        {
+            return_value = actual_read_len;
+        }
+    }
+
+    return return_value;
+}
+
+int allocate_new_buffer(size_t buffer_size)
+{
+    int return_value = 0;
+    
+    if (buffer_size <= 0)
+    {
+        return_value = -EFAULT;
+    }
+    else
+    {
+        char *buffer = kmalloc(buffer_size, GFP_KERNEL);
+        
+        if (NULL != driver_buffer && NULL != buffer)
+        {
+            size_t copy_size = min(buffer_size, driver_buffer_length);
+            memcpy(buffer, driver_buffer, copy_size);
+            kfree(driver_buffer);
+            driver_buffer = NULL;
+            driver_buffer_length = 0;
+        }
+
+        if (NULL != buffer)
+        {
+            driver_buffer = buffer;
+            driver_buffer_length = buffer_size;
+        }
+        else
+        {
+            return_value = -EAGAIN;
+        }
+    }
+    
+    return return_value;
+}
+
+static int __init buffer_init(void)
+{
+    /* Assume success until proven otherwise */
     int init_result = 0;
-    init_result = register_chrdev(driver_major_number,
-            DRIVER_NAME,
-            &reader_file_ops);
+    dev_t curr_dev;
+
+    alloc_chrdev_region(&dev_num, 0, 1, DRIVER_NAME);
+
+    driver_class = class_create(THIS_MODULE, DRIVER_NAME "_class");
+
+    cdev_init(&driver_cdev, &buffer_file_ops);
+
+    curr_dev = MKDEV(MAJOR(dev_num), MINOR(dev_num));
+
+    device_create(driver_class, NULL, curr_dev, NULL, "buffer_driver0");
+
+    cdev_add(&driver_cdev, curr_dev, 1); 
+
     if (init_result < 0)
     {
         printk(KERN_ERR "Failed to load %s driver while registering character device: %i\n", DRIVER_NAME, init_result);
@@ -87,33 +191,33 @@ int register_device(void)
     else
     {
         printk(KERN_NOTICE "Registered %s with major number %i\n", DRIVER_NAME, init_result);
-        driver_major_number = init_result;
-        init_result = 0;
+        init_result = allocate_new_buffer(DEFAULT_BUFFER_SIZE);
     }
-    return  init_result;
+    
+    return init_result;
 }
-
-int unregister_device(void)
+    
+static void __exit buffer_exit(void)
 {
     printk(KERN_NOTICE "Unregistering %s", DRIVER_NAME);
-    if (driver_major_number != 0)
+
+    cdev_del(&driver_cdev); 
+
+    device_destroy(driver_class, dev_num);
+
+    class_destroy(driver_class);
+
+    unregister_chrdev_region(dev_num, 1);
+
+    if (NULL != driver_buffer)
     {
-        unregister_chrdev(driver_major_number, DRIVER_NAME);
+        kfree(driver_buffer);
+        driver_buffer = NULL;
+        driver_buffer_length = 0;
     }
-    return 0;
-}
-
-static int reader_init(void)
-{
-    return 0;
 }
     
-static void reader_exit(void)
-{
-    return;
-}
-    
-module_init(reader_init);
-module_exit(reader_exit);
+module_init(buffer_init);
+module_exit(buffer_exit);
 
-MODULE_LICENSE("GPL3");
+MODULE_LICENSE("GPL");
